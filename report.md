@@ -99,7 +99,44 @@ Deviations from the paper, all forced by 2 GPUs: 1 GPU × 4 × 8 accumulation in
 | 75 | 54.4 | 40.6 | 26.9 |
 | 100 | 57.2 | 41.1 | 29.2 |
 
-**Results:** _pending_
+**Training results** (both runs completed 100 steps; tensorboard `outputs/opsd_1.7b/tb`)
+
+| | A: explicit (repo) | B: soft-KL fp32 |
+|---|---|---|
+| Wall time, 100 steps (1 A100 each, incl. vLLM rollouts) | 1h30 (58 s/step) | 1h43 (64 s/step, +11%) |
+| Grad norm, mean first 10 → last 10 steps | 0.039 → 0.018 (never norm-clipped) | 0.245 → 0.083 (norm-clipped to 0.1 until ~step 70) |
+| Optimized quantity, first 10 → last 10 | clipped per-entry "KL": 0.008 → **−0.013** | true forward KL: 0.136 → 0.077 (−43%) |
+| Checkpoints | LoRA only (149 MB each), no optimizer state | same |
+
+**The repo's clipped loss goes negative.** A true KL is ≥ 0, but clamping only the positive per-entry terms $q_v\log(q_v/p_v)$ leaves the negative ones (where student > teacher). The gradient w.r.t. logits is $Q_A p - q\odot\mathbb 1_A$, so for a *clipped* entry $v$ (teacher puts far more mass than student) the update is $z_v \mathrel{-}= Q_A p_v$: it is pushed **down** (via normalization), i.e. away from the teacher on the most informative entries. This follows from the derivation and is consistent with the observed negative loss; not separately verified.
+
+**Eval results** (updated as jobs finish; regenerate with `.venv/bin/python src/mtp_opsd_rl/scripts/eval_table.py outputs/opsd_1.7b`)
+
+Avg@12 % (pass@12 / maj@12). 30 problems per benchmark → one problem = 3.3 points; differences of a few points are within noise.
+
+| Step | Model | aime24 | aime25 | hmmt25 | mean |
+|---|---|---|---|---|---|
+| 0 | paper | 51.5 | 36.7 | 23.1 | 37.1 |
+| 0 | base (ours) | 49.2 (77/73) | 34.2 (63/47) | 23.6 (57/27) | 35.7 |
+| 100 | paper | 57.2 | 41.1 | 29.2 | 42.5 |
+| 100 | OPSD explicit (ours) | 52.5 (80/70) | … | … | … |
+| 100 | soft-KL OPSD (ours) | 44.4 (70/50) | … | … | … |
+
+**Response length on AIME24** (Qwen3 tokens, 360 generations each):
+
+| Model | median | mean | hit 38.9k cap | median len correct / wrong | Avg@12 |
+|---|---|---|---|---|---|
+| base | 16.5k | 17.5k | 1.9% | 9.9k / 23.3k | 49.2 |
+| OPSD explicit, step 100 | **20.9k (+26%)** | 20.6k | 3.9% | 13.2k / 25.9k | 52.5 |
+| soft-KL OPSD, step 100 | 16.2k (±0) | 16.7k | 1.4% | 9.7k / 20.6k | 44.4 |
+
+**Preliminary reading (AIME24 only):** explicit OPSD gains accuracy *and* thinks ~26% longer; soft-KL keeps length unchanged and loses accuracy (maj@12 73 → 50). Not a truncation/format issue (format 99%, fewer cap hits). Candidate causes, not yet separated:
+(1) step size — soft-KL updates ≈2.5× larger (grad norm clipped at 0.1 vs ≈0.04 unclipped for explicit);
+(2) no clipping — high-KL style tokens are unrestrained;
+(3) the repo's per-entry clip is a different objective (not KL) whose implicit target may be what lengthens reasoning.
+The explicit-no-clip run (§6) distinguishes these: if it also regresses, the clip (2/3) is what makes OPSD work; if it matches explicit-clipped, the gap is step size or soft-KL-specific.
+
+**Eval cost:** ~2 h per (model, benchmark) job on one A100 (360 generations up to 38,912 tokens, KV-cache bound). Queue order: base → step 100 → 50 → 75 → 25; base + step 100 done ≈ 14:00 on 2026-11-20, all 27 jobs ≈ 27 h. The queue is resumable (`eval_queue.py` skips finished jobs).
 
 **Where to look:** `tensorboard --logdir outputs/opsd_1.7b/tb` (training curves + `eval/*` scalars per run); `outputs/opsd_1.7b/eval/summary.jsonl`; logs in `outputs/opsd_1.7b/logs/`.
 
