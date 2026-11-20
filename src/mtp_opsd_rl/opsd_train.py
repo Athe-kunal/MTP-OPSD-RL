@@ -99,6 +99,25 @@ class CustomScriptArguments(ScriptArguments):
             "Default False (matches the main OPSD setup: student rolls out without <think>)."
         },
     )
+    soft_kl: bool = field(
+        default=False,
+        metadata={
+            "help": "Compute the forward-KL gradient with the KL gradient-recovery trick (two fused CEs on "
+            "post-norm hidden states) instead of materializing full-vocab logits. Requires --beta 0."
+        },
+    )
+    soft_kl_token_clip: float = field(
+        default=0.0,
+        metadata={"help": "Per-TOKEN KL clip for soft_kl (0 = off). Not the same as --jsd_token_clip (per vocab entry)."},
+    )
+    soft_kl_log_kl: bool = field(
+        default=False,
+        metadata={"help": "Log the true per-token forward KL in soft_kl mode (one extra no-grad chunked pass)."},
+    )
+    soft_kl_fp32: bool = field(
+        default=False,
+        metadata={"help": "Run soft_kl CE matmuls in fp32 (avoids bf16 cancellation between the two CE gradients)."},
+    )
     teacher_thinking: bool = field(
         default=True,
         metadata={
@@ -167,8 +186,12 @@ if __name__ == "__main__":
             "fixed_teacher=True requires use_peft=True. As the fixed teacher is implemented by disabling LoRA adapters."
         )
 
-    # Only initialize wandb on main process (LOCAL_RANK 0 or not set)
-    if os.environ.get("LOCAL_RANK", "0") == "0":
+    # Only initialize wandb on main process (LOCAL_RANK 0 or not set), and only if it's a requested logger
+    report_to = training_args.report_to or []
+    if isinstance(report_to, str):
+        report_to = [report_to]
+    use_wandb = "wandb" in report_to or "all" in report_to
+    if use_wandb and os.environ.get("LOCAL_RANK", "0") == "0":
         wandb.init(
             entity=training_args.wandb_entity,
             project=training_args.wandb_project,
@@ -231,7 +254,8 @@ if __name__ == "__main__":
         revision=model_args.model_revision,
         trust_remote_code=model_args.trust_remote_code,
         attn_implementation=model_args.attn_implementation or "flash_attention_2",
-        torch_dtype=model_dtype,
+        # string, not torch.dtype: training args get JSON-serialized by logging callbacks (tensorboard)
+        torch_dtype=str(model_dtype).removeprefix("torch."),
         use_cache=False if training_args.gradient_checkpointing else True,
     )
     quantization_config = get_quantization_config(model_args)
@@ -282,6 +306,10 @@ if __name__ == "__main__":
         ema_decay=script_args.ema_decay,
         student_thinking=script_args.student_thinking,
         teacher_thinking=script_args.teacher_thinking,
+        soft_kl=script_args.soft_kl,
+        soft_kl_token_clip=script_args.soft_kl_token_clip if script_args.soft_kl_token_clip > 0 else None,
+        soft_kl_log_kl=script_args.soft_kl_log_kl,
+        soft_kl_fp32=script_args.soft_kl_fp32,
     )
 
     if training_args.eval_strategy != "no":

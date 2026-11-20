@@ -4,7 +4,20 @@ version = "0.1.0"
 description = "Soft-KL (KL gradient-recovery trick) for OPSD and GRPO"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["torch"]
+dependencies = [
+    "accelerate==1.11.0",
+    "datasets>=5.0.1",
+    "deepspeed==0.18.2",
+    "flash-attn",
+    "math-verify>=0.9.0",
+    "peft==0.17.1",
+    "tensorboard>=2.21.0",
+    "torch==2.8.0",
+    "transformers==4.57.1",
+    "trl==0.26.0",
+    "vllm==0.11.0",
+    "wandb>=0.31.1",
+]
 
 [dependency-groups]
 dev = ["pytest"]
@@ -15,3 +28,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mtp_opsd_rl"]
+
+[tool.uv.sources]
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" }

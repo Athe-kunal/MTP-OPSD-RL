@@ -70,3 +70,19 @@ def test_ignored_positions_get_zero_grad_and_head_untouched():
     soft_kl_loss(W, h_s, h_t, labels).backward()
     assert torch.all(h_s.grad[labels == -100] == 0)
     assert W.grad is None  # W is detached inside the loss
+
+
+def test_per_token_clip_matches_clamped_per_token_kl():
+    W, h_s, h_t, labels = make(4)
+    s = F.log_softmax(h_s @ W.T, -1)
+    t = F.log_softmax(h_t @ W.T, -1)
+    kl_tok = (t.exp() * (t - s)).sum(-1)              # per-TOKEN KL (summed over vocab first)
+    mask = labels != -100
+    c = kl_tok[mask].median().item()                  # clip about half the tokens
+    ref = kl_tok.clamp(max=c)[mask].sum() / mask.sum()
+    stats = {}
+    g_ref = grad_hs(ref, h_s)
+    g_soft = grad_hs(soft_kl_loss(W, h_s, h_t, labels, token_clip=c, stats=stats), h_s)
+    assert torch.allclose(g_soft, g_ref, atol=1e-10)
+    assert abs(stats["kl_mean"] - (kl_tok[mask].sum() / mask.sum()).item()) < 1e-10
+    assert 0.3 < stats["clip_frac"] < 0.7

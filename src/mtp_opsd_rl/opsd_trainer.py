@@ -62,6 +62,19 @@ from trl.trainer.utils import (
 )
 from trl.experimental.gold.gold_config import GOLDConfig
 from data_collator import SelfDistillationDataCollator
+from soft_kl import soft_kl_loss
+
+
+@contextmanager
+def capture_final_hidden(causal_lm):
+    """Collect the output of the final RMSNorm (= the exact input to lm_head) during forwards.
+    `causal_lm` is the HF *ForCausalLM (e.g. peft_model.get_base_model())."""
+    store = []
+    handle = causal_lm.model.norm.register_forward_hook(lambda mod, inp, out: store.append(out))
+    try:
+        yield store
+    finally:
+        handle.remove()
 
 
 if is_peft_available():
@@ -144,6 +157,10 @@ class OPSDTrainer(SFTTrainer):
         ema_decay: float = 0.999,
         student_thinking: bool = False,
         teacher_thinking: bool = True,
+        soft_kl: bool = False,
+        soft_kl_token_clip: float | None = None,
+        soft_kl_log_kl: bool = False,
+        soft_kl_fp32: bool = False,
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
@@ -191,6 +208,26 @@ class OPSDTrainer(SFTTrainer):
         self.use_ema_teacher = use_ema_teacher
         self.ema_decay = ema_decay
         self._ema_params = None  # lazily initialized on first optimizer step
+
+        # Soft-KL: forward-KL gradient from two fused CEs (no [T, V] logits)
+        self.soft_kl = soft_kl
+        self.soft_kl_token_clip = soft_kl_token_clip
+        self.soft_kl_log_kl = soft_kl_log_kl
+        self.soft_kl_fp32 = soft_kl_fp32
+        if self.soft_kl:
+            if self.beta != 0:
+                raise ValueError("soft_kl reproduces forward KL only; use --beta 0")
+            if self.use_thinking_machines_loss or self.top_k_loss is not None:
+                raise ValueError("soft_kl is incompatible with use_tinker_loss and top_k_loss")
+            if self.jsd_token_clip is not None:
+                warnings.warn(
+                    "soft_kl ignores --jsd_token_clip (a per-vocab-ENTRY clamp the CE trick cannot express). "
+                    "Use --soft_kl_token_clip for a per-TOKEN clip."
+                )
+            print(f"\n{'='*80}\nSOFT-KL MODE: token_clip={soft_kl_token_clip}, log_kl={soft_kl_log_kl}\n{'='*80}\n")
+
+        # Peak-memory profiling of the loss forward+backward (set OPSD_MEM_PROFILE=1)
+        self._mem_profile = os.environ.get("OPSD_MEM_PROFILE", "0") == "1"
 
         # Validate fixed_teacher option
         if self.fixed_teacher and peft_config is None:
@@ -629,6 +666,9 @@ class OPSDTrainer(SFTTrainer):
 
         Memory optimization: Extract only needed log-probs immediately and free large tensors.
         """
+        if self.soft_kl:
+            return self._compute_soft_kl_loss(model, inputs, return_outputs)
+
         # Get batch-level prompt lengths
         student_prompt_len = inputs["student_prompt_length"]
         teacher_prompt_len = inputs["teacher_prompt_length"]
@@ -751,6 +791,72 @@ class OPSDTrainer(SFTTrainer):
             return (loss, minimal_output)
         else:
             return loss
+
+    def _compute_soft_kl_loss(self, model, inputs, return_outputs=False):
+        """Forward KL(teacher || student) via the KL gradient-recovery trick.
+
+        Same positions, mask, temperature and normalization as the explicit beta=0 path,
+        but we take the post-norm hidden states instead of logits (logits_to_keep=1), so
+        no [B, L, V] tensor is ever built. The gradient w.r.t. the student hidden states
+        equals that of the (optionally per-token clipped) forward KL.
+        """
+        sp = inputs["student_prompt_length"]
+        tp = inputs["teacher_prompt_length"]
+        labels = inputs["labels"][:, sp:]                                   # [B, C]
+
+        causal_lm = self.accelerator.unwrap_model(model).get_base_model()  # Qwen3ForCausalLM
+        W = causal_lm.lm_head.weight.detach()                               # frozen head [V, d]
+
+        # Student: with grad. logits_to_keep=1 -> lm_head runs on the last position only.
+        with capture_final_hidden(causal_lm) as hs:
+            model(
+                input_ids=inputs["student_input_ids"],
+                attention_mask=inputs["student_attention_mask"],
+                logits_to_keep=1,
+            )
+        h_s = hs[-1][:, sp - 1 : -1]                                       # [B, C, d] (tau applied in soft_kl_loss)
+
+        # Teacher: same model + privileged context, no grad (same context logic as the explicit path)
+        if self.use_ema_teacher:
+            adapter_context = self._ema_teacher_context(model)
+        elif self.fixed_teacher and is_peft_model(model):
+            adapter_context = self.accelerator.unwrap_model(model).disable_adapter()
+        else:
+            adapter_context = nullcontext()
+        with torch.no_grad(), adapter_context, capture_final_hidden(causal_lm) as ht:
+            model(
+                input_ids=inputs["teacher_input_ids"],
+                attention_mask=inputs["teacher_attention_mask"],
+                logits_to_keep=1,
+            )
+        h_t = ht[-1][:, tp - 1 : -1]                                       # [B, C, d]
+
+        if h_s.shape != h_t.shape:
+            raise RuntimeError(f"student/teacher completion misaligned: {tuple(h_s.shape)} vs {tuple(h_t.shape)}")
+
+        d = h_s.shape[-1]
+        stats = {}
+        loss = soft_kl_loss(
+            W,
+            h_s.reshape(-1, d),
+            h_t.reshape(-1, d),
+            labels.reshape(-1),
+            token_clip=self.soft_kl_token_clip,
+            compute_kl=self.soft_kl_log_kl,
+            stats=stats,
+            fp32=getattr(self, "soft_kl_fp32", False),
+            tau=self.temperature,
+        )
+        for k, v in stats.items():
+            self._metrics["train"][f"soft_kl/{k}"].append(v)
+
+        if return_outputs:
+            class MinimalOutput:
+                loss = None
+            out = MinimalOutput()
+            out.loss = loss
+            return loss, out
+        return loss
 
     def generate_teacher_reasoning(
         self, model, teacher_reasoning_prompts, teacher_reasoning_attention_mask=None
@@ -1438,7 +1544,33 @@ class OPSDTrainer(SFTTrainer):
             print(f"\nCompletion:\n{completion_texts[sample_idx]}")
             print(f"{'='*80}\n")
 
+        if self._mem_profile:
+            import json, time
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            mem_base = torch.cuda.memory_allocated()
+            t0 = time.time()
+
         loss = super().training_step(model, inputs, num_items_in_batch)
+
+        if self._mem_profile:
+            torch.cuda.synchronize()
+            gb = 1024**3
+            rec = {
+                "method": "soft_kl" if self.soft_kl else "explicit",
+                "max_completion_length": self.args.max_completion_length,
+                "rank": self.accelerator.process_index,
+                "step": self.state.global_step,
+                "seq_len_student": int(inputs["student_input_ids"].shape[1]),
+                "seq_len_teacher": int(inputs["teacher_input_ids"].shape[1]),
+                "valid_tokens": int((inputs["labels"] != -100).sum()),
+                "base_gb": round(mem_base / gb, 3),                       # weights, vLLM pool, optimizer bits
+                "peak_gb": round(torch.cuda.max_memory_allocated() / gb, 3),
+                "loss_delta_gb": round((torch.cuda.max_memory_allocated() - mem_base) / gb, 3),
+                "reserved_peak_gb": round(torch.cuda.max_memory_reserved() / gb, 3),
+                "loss_fwd_bwd_s": round(time.time() - t0, 3),
+            }
+            print("MEMPROF " + json.dumps(rec), flush=True)
 
         # Save generation outputs every N steps
         if (
